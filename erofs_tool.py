@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 
-# This file is part of Extractor.
-
-# Copyright (C) 2021 Security Research Labs GmbH
-# SPDX-License-Identifier: Apache-2.0
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# 	http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import argparse
 import mmap
 import os
@@ -32,11 +14,14 @@ import math
 import sys
 from stat import S_IFLNK, S_IFDIR, S_IFREG, S_IFMT
 
-
 # Parser for Huawei EROFS filesystem, used on some new models.
 # Supported by Linux Kernel 4.19 and later
 # drivers/staging/erofs
 # Filesystem generation tool at https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/
+
+struct_z_erofs_vle_cluster_index = Struct(
+    "blkaddr" / Int32ul
+)
 
 def main():
     parser = argparse.ArgumentParser(description='EROFS filesystem extractor')
@@ -285,6 +270,7 @@ class Erofs:
 
 
 class Inode:
+
     def __init__(self, erofs: Erofs, nid: int):
         self.erofs = erofs
         self.nid: int = nid
@@ -418,7 +404,47 @@ class Inode:
             # assert False
             return data
         elif self.data_mapping_mode == DataMappingMode.EROFS_INODE_FLAT_COMPRESSION:
-            raise NotImplementedError("TODO: Implement EROFS_INODE_FLAT_COMPRESSION")
+            num_clusters = self.inode_header.i_u
+
+            pos = self.xattr_start_off + self.xattr_size
+            if pos % 8 != 0:
+                pos = (pos + 7) & ~7
+
+            hdr = struct_z_erofs_map_header.parse(
+                self.erofs.mmap[pos:pos + struct_z_erofs_map_header.sizeof()]
+            )
+            pos += struct_z_erofs_map_header.sizeof()
+
+            cluster_size = 1 << hdr.h_clusterbits
+            out = BytesIO()
+
+            for i in range(num_clusters):
+                idx_off = pos + i * 4
+                idx = struct_z_erofs_vle_cluster_index.parse(
+                    self.erofs.mmap[idx_off:idx_off + 4]
+                )
+
+                blkaddr = idx.blkaddr
+                if blkaddr == 0:
+                    continue
+
+                data = self.erofs.mmap[
+                    blkaddr * 4096 :
+                    blkaddr * 4096 + cluster_size
+                ]
+
+                # LZ4 raw block
+                decompressed = pp_decompress_lz4(
+                    data,
+                    maxlen=self.inode_header.i_size - out.tell()
+                )
+
+                out.write(decompressed)
+
+                if out.tell() >= self.inode_header.i_size:
+                    break
+
+            return out.getvalue()[:self.inode_header.i_size]
         else:
             raise ValueError("Don't know how to get data for data_mapping_mode=%r" % self.data_mapping_mode)
 
@@ -529,6 +555,7 @@ class DirInode(Inode):
             # Some versions of mkfs.erofs add entries for "." and ".."
             if dirent.filename in (b'.', b'..'):
                 continue
+            
             if os.path.exists(out_path):
                 raise ValueError("Duplicate file %r" % out_path)
             child_inode = self.erofs.get_inode(dirent.nid, dirent.file_type)
@@ -539,7 +566,7 @@ class DirInode(Inode):
                 # Always make directories mode 755
                 os.chmod(out_path, 0o755)
                 child_inode.extract(out_path, verify_zip=verify_zip)
-            elif dirent.file_type == FileType.EROFS_FT_REG_FILE:
+            elif dirent.file_type == FileType.EROFS_FT_REG_FILE:                
                 with open(out_path, 'wb') as f:
                     f.write(child_inode.get_data())
                 # use original mode & 0o755 => Ignore setuid/setgid bit
@@ -582,78 +609,67 @@ def hd(buf: bytes):
     p.wait()
 
 
-def pp_decompress_lz4(buf: bytes, maxlen: int = None, expected: bytes = None) -> bytes:
-    """
-    https://github.com/lz4/lz4/blob/master/doc/lz4_Block_format.md
-    :param buf: Compressed buffer, raw LZ4 without framing or length header
-    :param maxlen: Maximum length to extract, will return buffer after extracting that amount of bytes
-    :param expected: Optional known decompressed value to debug extraction errors
-    :return:
-    """
-    with BytesIO() as out:
-        pos = 0
-        while pos < len(buf):
-            token_byte = buf[pos]
-            # print("Token 0x%02x at 0x%x" % (token_byte, pos))
-            pos += 1
-            # Get length of literal from input
-            literal_length = token_byte >> 4
-            if literal_length == 0xf:
-                length_byte = buf[pos]
+def pp_decompress_lz4(buf, expected_size=None, maxlen=None):
+    if expected_size is None:
+        expected_size = maxlen
+    if expected_size is None:
+        raise ValueError("pp_decompress_lz4: expected_size/maxlen required")
+
+    pos = 0
+    out = bytearray()
+    buf_len = len(buf)
+
+    while pos < buf_len and len(out) < expected_size:
+        if pos >= buf_len:
+            break
+
+        token = buf[pos]
+        pos += 1
+
+        # === literal length ===
+        lit_len = token >> 4
+        if lit_len == 15:
+            while pos < buf_len:
+                b = buf[pos]
                 pos += 1
-                literal_length += length_byte
-                while length_byte == 0xff:
-                    length_byte = buf[pos]
-                    pos += 1
-                    literal_length += length_byte
-            literal_buf = buf[pos: pos + literal_length]
-            pos += literal_length
-            if expected is not None:
-                for i in range(len(literal_buf)):
-                    assert literal_buf[i] == expected[out.tell() + i], "Mismatch at position 0x%x: %r <=> %r" % (out.tell() + i, literal_buf[i], expected[out.tell() + i])
-            out.write(literal_buf)
-            if maxlen is not None and out.tell() >= maxlen:
-                return out.getvalue()[0:maxlen]
-            if pos == len(buf) or pos == len(buf) - 1:
-                # Reached end of input after literal => OK
+                lit_len += b
+                if b != 255:
+                    break
+
+        if pos + lit_len > buf_len:
+            lit_len = buf_len - pos
+
+        take = min(lit_len, expected_size - len(out))
+        out += buf[pos:pos + take]
+        pos += lit_len
+
+        if len(out) >= expected_size or pos >= buf_len:
+            break
+
+        # === offset ===
+        if pos + 2 > buf_len:
+            break
+        offset = buf[pos] | (buf[pos + 1] << 8)
+        pos += 2
+
+        # === match length ===
+        match_len = (token & 0x0F) + 4
+        if (token & 0x0F) == 15:
+            while pos < buf_len:
+                b = buf[pos]
+                pos += 1
+                match_len += b
+                if b != 255:
+                    break
+
+        for _ in range(match_len):
+            if len(out) >= expected_size:
                 break
-            # print("OFFSET POS: 0x%x" % pos)
-            # Get offset for copy operation
-            offset = buf[pos] + 256 * buf[pos + 1]
-            pos += 2
-            if offset == 0:
-                continue
-                # raise ValueError("Offset cannot be 0")
-            # Get matchlength for copy operation
-            matchlength = token_byte & 0x0f
-            if matchlength == 0xf:
-                length_byte = buf[pos]
-                pos += 1
-                matchlength += length_byte
-                while length_byte == 0xff:
-                    length_byte = buf[pos]
-                    pos += 1
-                    matchlength += length_byte
-            matchlength += 4
-            match_pos = out.tell() - offset
-            while matchlength > 0:
-                copylen = min(matchlength, out.tell() - match_pos)
-                copybuf = out.getvalue()[match_pos: match_pos + copylen]
-                if expected is not None:
-                    for i in range(len(copybuf)):
-                        assert copybuf[i] == expected[out.tell() + i], "Mismatch at position %r" % (out.tell() + i)
-                out.write(copybuf)
-                if maxlen is not None and out.tell() >= maxlen:
-                    return out.getvalue()[0:maxlen]
-                matchlength -= copylen
-                # print("copylen=%r" % copylen)
-                # Copy from the original position => Copy as many bytes as possible at a time
-                assert copylen % offset == 0 or matchlength == 0
-                # match_pos += copylen % offset
-            # Old, un-optimized code:
-            # for i in range(matchlength):
-            #     out.write(out.getvalue()[match_pos + i:match_pos + i + 1])
-        return out.getvalue()
+            out.append(out[-offset])
+
+    return bytes(out)
+
+
 
 
 if __name__ == "__main__":
